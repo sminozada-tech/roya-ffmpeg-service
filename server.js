@@ -2,10 +2,9 @@ const express = require('express');
 const { exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const axios = require('axios');
 
 const app = express();
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({ limit: '50mb' })); // Increased limit for base64 videos
 
 const UPLOAD_DIR = '/tmp/uploads';
 const OUTPUT_DIR = '/tmp/output';
@@ -17,27 +16,15 @@ app.post('/stitch', async (req, res) => {
   try {
     const { videos, output_name } = req.body;
     
-    console.log(`Received ${videos.length} videos to stitch`);
+    console.log(`Received ${videos.length} videos (base64) to stitch`);
     
     const videoPaths = [];
     for (let i = 0; i < videos.length; i++) {
-      const videoUrl = videos[i];
+      const base64Data = videos[i];
       const localPath = path.join(UPLOAD_DIR, `scene${i + 1}.mp4`);
       
-      console.log(`Downloading video ${i + 1}...`);
-      const response = await axios({
-        url: videoUrl,
-        method: 'GET',
-        responseType: 'stream'
-      });
-      
-      await new Promise((resolve, reject) => {
-        const writer = fs.createWriteStream(localPath);
-        response.data.pipe(writer);
-        writer.on('finish', resolve);
-        writer.on('error', reject);
-      });
-      
+      // Write base64 data directly to file
+      fs.writeFileSync(localPath, base64Data, 'base64');
       videoPaths.push(localPath);
     }
     
@@ -55,7 +42,7 @@ app.post('/stitch', async (req, res) => {
           console.error('FFmpeg error:', stderr);
           reject(error);
         } else {
-          console.log('FFmpeg complete:', stdout);
+          console.log('FFmpeg complete');
           resolve();
         }
       });
@@ -64,11 +51,10 @@ app.post('/stitch', async (req, res) => {
     const videoBuffer = fs.readFileSync(outputPath);
     const base64Video = videoBuffer.toString('base64');
     
+    // Cleanup
     videoPaths.forEach(p => fs.unlinkSync(p));
     fs.unlinkSync(concatFile);
     fs.unlinkSync(outputPath);
-    
-    console.log('Sending stitched video...');
     
     res.json({
       success: true,
