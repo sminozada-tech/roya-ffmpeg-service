@@ -16,7 +16,7 @@ app.post('/stitch', async (req, res) => {
   console.log('=== REQUEST RECEIVED ===');
   
   try {
-    const { videos, audios, output_name } = req.body;
+    const { videos, audios, subtitles, output_name } = req.body;
     
     if (!videos || videos.length === 0) {
       throw new Error('No videos provided');
@@ -31,7 +31,6 @@ app.post('/stitch', async (req, res) => {
 
     const finalClips = [];
 
-    // Process each clip
     for (let i = 0; i < videos.length; i++) {
       console.log(`\n--- Clip ${i+1} ---`);
       
@@ -46,47 +45,71 @@ app.post('/stitch', async (req, res) => {
         const vSize = fs.statSync(vPath).size;
         console.log(`Video: ${vSize} bytes`);
 
-        if (vSize < 1000) {
-          console.log('⚠️ Video too small, skipping');
+        if (vSize < 10000) {
+          console.log('️ Video too small, skipping');
           continue;
         }
 
-        // Try to merge with audio
+        let hasAudio = false;
         if (audios && audios[i]) {
           fs.writeFileSync(aPath, Buffer.from(audios[i], 'base64'));
+          hasAudio = true;
           console.log(`Audio: ${fs.statSync(aPath).size} bytes`);
-          
-          try {
-            await execAsync(`ffmpeg -y -i "${vPath}" -i "${aPath}" -c:v copy -c:a aac -map 0:v -map 1:a -shortest "${outPath}"`);
-            console.log('✓ Merged with audio');
-          } catch (e) {
-            console.log('⚠️ Merge failed, using video only');
-            fs.copyFileSync(vPath, outPath);
-          }
-        } else {
-          fs.copyFileSync(vPath, outPath);
         }
 
-        if (fs.existsSync(outPath) && fs.statSync(outPath).size > 1000) {
+        // Build FFmpeg command with subtitles
+        const subText = (subtitles && subtitles[i]) ? subtitles[i].replace(/'/g, '').replace(/:/g, '') : '';
+        
+        let cmd = `ffmpeg -y -i "${vPath}"`;
+        
+        if (hasAudio) {
+          cmd += ` -i "${aPath}"`;
+        }
+
+        if (subText) {
+          const filter = `drawtext=text='${subText}':fontcolor=white:fontsize=40:x=(w-text_w)/2:y=h-120:shadowcolor=black:shadowx=3:shadowy=3:fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf`;
+          cmd += ` -vf "${filter}"`;
+          
+          if (hasAudio) {
+            cmd += ` -c:a aac -map 0:v -map 1:a -shortest`;
+          } else {
+            cmd += ` -an`;
+          }
+        } else {
+          if (hasAudio) {
+            cmd += ` -c:v copy -c:a aac -map 0:v -map 1:a -shortest`;
+          } else {
+            cmd += ` -c:v copy -an`;
+          }
+        }
+
+        cmd += ` "${outPath}"`;
+        
+        console.log('Running FFmpeg...');
+        await execAsync(cmd);
+        
+        if (fs.existsSync(outPath) && fs.statSync(outPath).size > 10000) {
           finalClips.push(outPath);
           console.log(`✓ Clip ${i+1} ready`);
+        } else {
+          console.log('⚠️ Output too small, using original');
+          finalClips.push(vPath);
         }
 
       } catch (e) {
         console.error(`Clip ${i} error:`, e.message);
+        if (fs.existsSync(vPath)) finalClips.push(vPath);
       }
     }
 
     console.log(`\n=== STITCHING ${finalClips.length} CLIPS ===`);
 
     if (finalClips.length === 0) {
-      throw new Error('No valid clips to stitch');
+      throw new Error('No valid clips');
     }
 
-    // If only 1 clip, just return it
     if (finalClips.length === 1) {
       const buffer = fs.readFileSync(finalClips[0]);
-      console.log(`✓ Single clip: ${buffer.length} bytes`);
       return res.json({ success: true, video: buffer.toString('base64') });
     }
 
@@ -94,26 +117,19 @@ app.post('/stitch', async (req, res) => {
     const concatPath = path.join(UPLOAD_DIR, 'concat.txt');
     const concatContent = finalClips.map(f => `file '${path.resolve(f)}'`).join('\n');
     fs.writeFileSync(concatPath, concatContent);
-    console.log('Concat file:', concatContent);
 
     // Final output
     const outFile = path.join(OUTPUT_DIR, `${output_name || 'video'}.mp4`);
     
-    // Try concat demuxer
     try {
       await execAsync(`ffmpeg -y -f concat -safe 0 -i "${concatPath}" -c copy "${outFile}"`);
       console.log('✓ Concat succeeded');
     } catch (e) {
-      console.log('⚠️ Concat failed:', e.message);
-      
-      // Fallback: use first clip
-      console.log('Using first clip as fallback');
+      console.log('️ Concat failed, using first clip');
       fs.copyFileSync(finalClips[0], outFile);
     }
 
-    // Verify output
-    if (!fs.existsSync(outFile) || fs.statSync(outFile).size < 1000) {
-      console.log('⚠️ Output invalid, using first clip');
+    if (!fs.existsSync(outFile) || fs.statSync(outFile).size < 10000) {
       fs.copyFileSync(finalClips[0], outFile);
     }
 
@@ -125,16 +141,7 @@ app.post('/stitch', async (req, res) => {
   } catch (error) {
     console.error('=== ERROR ===');
     console.error(error.message);
-    
-    // Return error video (1 second black screen)
-    try {
-      const errorPath = path.join(OUTPUT_DIR, 'error.mp4');
-      await execAsync(`ffmpeg -y -f lavfi -i color=c=black:s=720x1280:d=1 -c:v libx264 "${errorPath}"`);
-      const buffer = fs.readFileSync(errorPath);
-      res.json({ success: false, error: error.message, video: buffer.toString('base64') });
-    } catch (e) {
-      res.status(500).json({ error: error.message });
-    }
+    res.status(500).json({ error: error.message });
   }
 });
 
