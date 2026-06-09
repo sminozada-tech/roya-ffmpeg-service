@@ -2,9 +2,10 @@ const express = require('express');
 const { exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-
+const https = require('https');
+const http = require('http');
 const app = express();
-app.use(express.json({ limit: '200mb' }));
+app.use(express.json({ limit: '50mb' }));
 
 const UPLOAD_DIR = '/tmp/uploads';
 const OUTPUT_DIR = '/tmp/output';
@@ -12,152 +13,147 @@ const OUTPUT_DIR = '/tmp/output';
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
-app.post('/stitch', async (req, res) => {
-  console.log('=== REQUEST RECEIVED ===');
-  
-  try {
-    const { videos, audios, subtitles, output_name } = req.body;
-    
-    if (!videos || videos.length === 0) {
-      throw new Error('No videos provided');
-    }
-
-    console.log(`Processing ${videos.length} videos`);
-
-    // Clean up
-    try {
-      fs.readdirSync(UPLOAD_DIR).forEach(f => fs.unlinkSync(path.join(UPLOAD_DIR, f)));
-    } catch(e) {}
-
-    const finalClips = [];
-
-    for (let i = 0; i < videos.length; i++) {
-      console.log(`\n--- Clip ${i+1} ---`);
-      
-      const vPath = path.join(UPLOAD_DIR, `v${i}.mp4`);
-      const aPath = path.join(UPLOAD_DIR, `a${i}.mp3`);
-      const outPath = path.join(UPLOAD_DIR, `out${i}.mp4`);
-
-      try {
-        // Write video
-        const vData = videos[i].includes('base64,') ? videos[i].split('base64,')[1] : videos[i];
-        fs.writeFileSync(vPath, Buffer.from(vData, 'base64'));
-        const vSize = fs.statSync(vPath).size;
-        console.log(`Video: ${vSize} bytes`);
-
-        if (vSize < 10000) {
-          console.log('⚠️ Video too small, skipping');
-          continue;
-        }
-
-        let hasAudio = false;
-        if (audios && audios[i]) {
-          fs.writeFileSync(aPath, Buffer.from(audios[i], 'base64'));
-          hasAudio = true;
-          console.log(`Audio: ${fs.statSync(aPath).size} bytes`);
-        }
-
-        // Build FFmpeg command with subtitles
-        const subText = (subtitles && subtitles[i]) ? subtitles[i].replace(/'/g, '').replace(/:/g, '') : '';
-        
-        let cmd = `ffmpeg -y -i "${vPath}"`;
-        
-        if (hasAudio) {
-          cmd += ` -i "${aPath}"`;
-        }
-
-        if (subText) {
-          const filter = `drawtext=text='${subText}':fontcolor=white:fontsize=40:x=(w-text_w)/2:y=h-120:shadowcolor=black:shadowx=3:shadowy=3:fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf`;
-          cmd += ` -vf "${filter}"`;
-          
-          if (hasAudio) {
-            cmd += ` -c:a aac -map 0:v -map 1:a -shortest`;
-          } else {
-            cmd += ` -an`;
-          }
-        } else {
-          if (hasAudio) {
-            cmd += ` -c:v copy -c:a aac -map 0:v -map 1:a -shortest`;
-          } else {
-            cmd += ` -c:v copy -an`;
-          }
-        }
-
-        cmd += ` "${outPath}"`;
-        
-        console.log('Running FFmpeg...');
-        await execAsync(cmd);
-        
-        if (fs.existsSync(outPath) && fs.statSync(outPath).size > 10000) {
-          finalClips.push(outPath);
-          console.log(`✓ Clip ${i+1} ready`);
-        } else {
-          console.log('⚠️ Output too small, using original');
-          finalClips.push(vPath);
-        }
-
-      } catch (e) {
-        console.error(`Clip ${i} error:`, e.message);
-        if (fs.existsSync(vPath)) finalClips.push(vPath);
-      }
-    }
-
-    console.log(`\n=== STITCHING ${finalClips.length} CLIPS ===`);
-
-    if (finalClips.length === 0) {
-      throw new Error('No valid clips');
-    }
-
-    if (finalClips.length === 1) {
-      const buffer = fs.readFileSync(finalClips[0]);
-      return res.json({ success: true, video: buffer.toString('base64') });
-    }
-
-    // Create concat file
-    const concatPath = path.join(UPLOAD_DIR, 'concat.txt');
-    const concatContent = finalClips.map(f => `file '${path.resolve(f)}'`).join('\n');
-    fs.writeFileSync(concatPath, concatContent);
-
-    // Final output
-    const outFile = path.join(OUTPUT_DIR, `${output_name || 'video'}.mp4`);
-    
-    try {
-      await execAsync(`ffmpeg -y -f concat -safe 0 -i "${concatPath}" -c copy "${outFile}"`);
-      console.log('✓ Concat succeeded');
-    } catch (e) {
-      console.log('️ Concat failed, using first clip');
-      fs.copyFileSync(finalClips[0], outFile);
-    }
-
-    if (!fs.existsSync(outFile) || fs.statSync(outFile).size < 10000) {
-      fs.copyFileSync(finalClips[0], outFile);
-    }
-
-    const buffer = fs.readFileSync(outFile);
-    console.log(`✓ Final video: ${buffer.length} bytes`);
-    
-    res.json({ success: true, video: buffer.toString('base64') });
-
-  } catch (error) {
-    console.error('=== ERROR ===');
-    console.error(error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-function execAsync(cmd) {
+function downloadFile(url, destPath) {
   return new Promise((resolve, reject) => {
-    console.log('Running:', cmd);
-    exec(cmd, (error, stdout, stderr) => {
-      if (error) {
-        console.error('FFmpeg error:', stderr);
-        reject(error);
-      } else {
-        resolve({ stdout, stderr });
+    const file = fs.createWriteStream(destPath);
+    const protocol = url.startsWith('https') ? https : http;
+    protocol.get(url, (response) => {
+      if (response.statusCode === 302 || response.statusCode === 301) {
+        downloadFile(response.headers.location, destPath).then(resolve).catch(reject);
+        return;
       }
+      response.pipe(file);
+      file.on('finish', () => { file.close(); resolve(); });
+    }).on('error', (err) => {
+      fs.unlink(destPath, () => {});
+      reject(err);
     });
   });
 }
+
+function createSRT(text, durationSeconds) {
+  if (!text || text.trim() === '') return null;
+  const words = text.trim().split(' ');
+  const wordsPerLine = 4;
+  const lines = [];
+  for (let i = 0; i < words.length; i += wordsPerLine) {
+    lines.push(words.slice(i, i + wordsPerLine).join(' '));
+  }
+  const timePerLine = durationSeconds / lines.length;
+  let srt = '';
+  lines.forEach((line, i) => {
+    const start = i * timePerLine;
+    const end = (i + 1) * timePerLine;
+    const fmt = (s) => {
+      const h = Math.floor(s / 3600).toString().padStart(2, '0');
+      const m = Math.floor((s % 3600) / 60).toString().padStart(2, '0');
+      const sec = Math.floor(s % 60).toString().padStart(2, '0');
+      const ms = Math.floor((s % 1) * 1000).toString().padStart(3, '0');
+      return `${h}:${m}:${sec},${ms}`;
+    };
+    srt += `${i + 1}\n${fmt(start)} --> ${fmt(end)}\n${line}\n\n`;
+  });
+  return srt;
+}
+
+app.post('/stitch', async (req, res) => {
+  try {
+    const { video_urls, audios, captions, output_name } = req.body;
+    console.log(`URLs: ${video_urls.length}, Audios: ${audios ? audios.length : 0}`);
+
+    fs.readdirSync(UPLOAD_DIR).forEach(file => {
+      try { fs.unlinkSync(path.join(UPLOAD_DIR, file)); } catch(e) {}
+    });
+
+    const finalScenePaths = [];
+
+    for (let i = 0; i < video_urls.length; i++) {
+      // Download video from GCS URL
+      const videoPath = path.join(UPLOAD_DIR, `scene${i + 1}_raw.mp4`);
+      console.log(`Downloading scene ${i + 1} from: ${video_urls[i]}`);
+      await downloadFile(video_urls[i], videoPath);
+
+      const videoStats = fs.statSync(videoPath);
+      console.log(`Scene ${i + 1} size: ${videoStats.size} bytes`);
+      if (videoStats.size === 0) throw new Error(`Video ${i + 1} is empty!`);
+
+      const videoDuration = await new Promise((resolve) => {
+        exec(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 ${videoPath}`, (err, stdout) => {
+          resolve(parseFloat(stdout) || 8);
+        });
+      });
+      console.log(`Scene ${i + 1} duration: ${videoDuration}s`);
+
+      let currentPath = videoPath;
+
+      // Merge audio
+      if (audios && audios[i] && audios[i].length > 0) {
+        const audioPath = path.join(UPLOAD_DIR, `scene${i + 1}_audio.mp3`);
+        const cleanAudio = audios[i].replace(/^data:audio\/mp3;base64,/, '').replace(/^data:audio\/mpeg;base64,/, '');
+        fs.writeFileSync(audioPath, Buffer.from(cleanAudio, 'base64'));
+
+        const mergedPath = path.join(UPLOAD_DIR, `scene${i + 1}_merged.mp4`);
+        await new Promise((resolve, reject) => {
+          const cmd = `ffmpeg -y -i ${currentPath} -i ${audioPath} -map 0:v -map 1:a -c:v copy -c:a aac -t ${videoDuration} ${mergedPath}`;
+          exec(cmd, (error, stdout, stderr) => {
+            if (error) { console.error(stderr); reject(error); }
+            else { console.log(`Audio merged scene ${i + 1}`); resolve(); }
+          });
+        });
+        currentPath = mergedPath;
+      }
+
+      // Add captions
+      if (captions && captions[i] && captions[i].trim().length > 0) {
+        const srtContent = createSRT(captions[i], videoDuration);
+        if (srtContent) {
+          const srtPath = path.join(UPLOAD_DIR, `scene${i + 1}.srt`);
+          fs.writeFileSync(srtPath, srtContent);
+
+          const captionedPath = path.join(UPLOAD_DIR, `scene${i + 1}_captioned.mp4`);
+          await new Promise((resolve, reject) => {
+            const cmd = `ffmpeg -y -i ${currentPath} -vf "subtitles=${srtPath}:force_style='FontName=Arial,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=3,Bold=1,Alignment=2,MarginV=60'" -c:a copy ${captionedPath}`;
+            exec(cmd, (error, stdout, stderr) => {
+              if (error) { console.error(stderr); reject(error); }
+              else { console.log(`Captions added scene ${i + 1}`); resolve(); }
+            });
+          });
+          currentPath = captionedPath;
+        }
+      }
+
+      finalScenePaths.push(currentPath);
+    }
+
+    // Stitch all scenes
+    const concatFile = path.join(UPLOAD_DIR, 'concat.txt');
+    fs.writeFileSync(concatFile, finalScenePaths.map(p => `file '${p}'`).join('\n'));
+
+    const outputFileName = (output_name || 'stitched-video').replace(/[^a-zA-Z0-9_-]/g, '_');
+    const outputPath = path.join(OUTPUT_DIR, `${outputFileName}.mp4`);
+
+    await new Promise((resolve, reject) => {
+      const cmd = `ffmpeg -y -f concat -safe 0 -i ${concatFile} -c:a aac -c:v libx264 ${outputPath}`;
+      exec(cmd, (error, stdout, stderr) => {
+        if (error) { console.error(stderr); reject(error); }
+        else { console.log('Stitched!'); resolve(); }
+      });
+    });
+
+    const videoBuffer = fs.readFileSync(outputPath);
+    const base64Video = videoBuffer.toString('base64');
+
+    finalScenePaths.forEach(p => { try { fs.unlinkSync(p); } catch(e) {} });
+    try { fs.unlinkSync(concatFile); } catch(e) {}
+    try { fs.unlinkSync(outputPath); } catch(e) {}
+
+    res.json({ success: true, video: base64Video, filename: `${outputFileName}.mp4` });
+
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: error.message, stack: error.stack });
+  }
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`FFmpeg service running on port ${PORT}`));
