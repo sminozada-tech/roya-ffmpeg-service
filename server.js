@@ -6,7 +6,7 @@ const util = require('util');
 const execPromise = util.promisify(exec);
 
 const app = express();
-app.use(express.json({ limit: '150mb' }));
+app.use(express.json({ limit: '200mb' }));
 
 const UPLOAD_DIR = '/tmp/uploads';
 const OUTPUT_DIR = '/tmp/output';
@@ -18,8 +18,7 @@ app.post('/stitch', async (req, res) => {
   try {
     const { videos, audios, subtitles, output_name } = req.body;
     console.log(`=== STARTING PROCESS ===`);
-    console.log(`Videos: ${videos ? videos.length : 0}`);
-    console.log(`Audios: ${audios ? audios.length : 0}`);
+    console.log(`Videos received: ${videos ? videos.length : 0}`);
 
     // Clean up
     const oldFiles = fs.readdirSync(UPLOAD_DIR);
@@ -28,27 +27,38 @@ app.post('/stitch', async (req, res) => {
     const finalPaths = [];
 
     for (let i = 0; i < videos.length; i++) {
-      console.log(`\n=== Scene ${i + 1} ===`);
+      console.log(`\n=== Processing Scene ${i + 1} ===`);
       
       const videoPath = path.join(UPLOAD_DIR, `scene${i+1}.mp4`);
       const audioPath = path.join(UPLOAD_DIR, `scene${i+1}.mp3`);
-      const outputPath = path.join(UPLOAD_DIR, `final${i+1}.mp4`);
+      const fixedPath = path.join(UPLOAD_DIR, `fixed${i+1}.mp4`);
+      const finalPath = path.join(UPLOAD_DIR, `final${i+1}.mp4`);
 
       try {
-        // Write video - handle both with and without data: prefix
+        // Write video
         let videoBase64 = videos[i];
         if (videoBase64.includes('base64,')) {
           videoBase64 = videoBase64.split('base64,')[1];
         }
         fs.writeFileSync(videoPath, Buffer.from(videoBase64, 'base64'));
-        console.log(`✓ Video written (${fs.statSync(videoPath).size} bytes)`);
+        const videoSize = fs.statSync(videoPath).size;
+        console.log(`Video written: ${videoSize} bytes`);
 
-        // Check if video is valid
+        // Try to fix corrupted video
         try {
-          await execPromise(`ffmpeg -y -i "${videoPath}" -f null - 2>&1 | head -20`);
-          console.log('✓ Video is valid');
+          console.log('Attempting to fix video...');
+          const fixCmd = `ffmpeg -y -i "${videoPath}" -c copy -movflags +faststart "${fixedPath}" 2>&1`;
+          await execPromise(fixCmd);
+          
+          if (fs.existsSync(fixedPath) && fs.statSync(fixedPath).size > 0) {
+            console.log('✓ Video fixed successfully');
+          } else {
+            console.log('⚠️ Fix failed, using original');
+            fs.copyFileSync(videoPath, fixedPath);
+          }
         } catch (e) {
-          console.log('⚠️ Video might be corrupted, continuing anyway...');
+          console.log('⚠️ Video might be corrupted, continuing...');
+          fs.copyFileSync(videoPath, fixedPath);
         }
 
         // Write audio if exists
@@ -56,54 +66,67 @@ app.post('/stitch', async (req, res) => {
         if (audios && audios[i]) {
           fs.writeFileSync(audioPath, Buffer.from(audios[i], 'base64'));
           hasAudio = true;
-          console.log(`✓ Audio written (${fs.statSync(audioPath).size} bytes)`);
+          console.log(`✓ Audio written: ${fs.statSync(audioPath).size} bytes`);
         }
 
-        // Merge video + audio (skip subtitles for now - they're causing issues)
-        let cmd;
+        // Merge video + audio with error recovery
+        let mergeCmd;
         if (hasAudio) {
-          cmd = `ffmpeg -y -i "${videoPath}" -i "${audioPath}" -c:v copy -c:a aac -map 0:v -map 1:a -shortest "${outputPath}"`;
+          // Try to merge, ignore errors
+          mergeCmd = `ffmpeg -y -i "${fixedPath}" -i "${audioPath}" -c:v copy -c:a aac -map 0:v -map 1:a -shortest "${finalPath}" 2>&1 || cp "${fixedPath}" "${finalPath}"`;
         } else {
-          cmd = `ffmpeg -y -i "${videoPath}" -c copy -an "${outputPath}"`;
+          mergeCmd = `cp "${fixedPath}" "${finalPath}"`;
         }
 
-        console.log(`Running: ${cmd}`);
-        await execPromise(cmd);
-        console.log(`✓ Merge complete`);
+        console.log('Merging...');
+        await execPromise(mergeCmd);
         
-        finalPaths.push(outputPath);
+        if (fs.existsSync(finalPath)) {
+          console.log(`✓ Final scene ${i+1}: ${fs.statSync(finalPath).size} bytes`);
+          finalPaths.push(finalPath);
+        } else {
+          console.log('⚠️ Final file not created, using fixed version');
+          finalPaths.push(fixedPath);
+        }
 
       } catch (error) {
-        console.error(`Scene ${i+1} error:`, error.message);
-        // Use original video as fallback
-        if (fs.existsSync(videoPath)) {
+        console.error(`Scene ${i+1} failed:`, error.message);
+        // Try to use whatever we have
+        if (fs.existsSync(fixedPath)) {
+          finalPaths.push(fixedPath);
+        } else if (fs.existsSync(videoPath)) {
           finalPaths.push(videoPath);
         }
       }
     }
 
+    console.log(`\n=== Stitching ${finalPaths.length} scenes ===`);
+    
     // Create concat file
     const concatFile = path.join(UPLOAD_DIR, 'concat.txt');
-    const concatContent = finalPaths.map(p => `file '${p}'`).join('\n');
+    const concatContent = finalPaths.map(p => `file '${path.resolve(p)}'`).join('\n');
     fs.writeFileSync(concatFile, concatContent);
-    console.log(`\nConcat file:\n${concatContent}`);
+    console.log(`Concat file:\n${concatContent}`);
 
-    // Stitch all
+    // Stitch all scenes
     const outputFileName = (output_name || 'stitched-video').replace(/[^a-zA-Z0-9_-]/g, '_');
     const outputPath = path.join(OUTPUT_DIR, `${outputFileName}.mp4`);
     
-    const stitchCmd = `ffmpeg -y -f concat -safe 0 -i "${concatFile}" -c copy "${outputPath}"`;
-    console.log(`\nStitching: ${stitchCmd}`);
+    const stitchCmd = `ffmpeg -y -f concat -safe 0 -i "${concatFile}" -c copy "${outputPath}" 2>&1 || echo "Stitch failed"`;
     await execPromise(stitchCmd);
 
-    const videoBuffer = fs.readFileSync(outputPath);
-    console.log(`✓ Final video: ${videoBuffer.length} bytes`);
-    
-    res.json({ 
-      success: true, 
-      video: videoBuffer.toString('base64'), 
-      filename: `${outputFileName}.mp4`
-    });
+    if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
+      const videoBuffer = fs.readFileSync(outputPath);
+      console.log(`✓ Success: ${videoBuffer.length} bytes`);
+      
+      res.json({ 
+        success: true, 
+        video: videoBuffer.toString('base64'), 
+        filename: `${outputFileName}.mp4`
+      });
+    } else {
+      throw new Error('No output video created');
+    }
 
   } catch (error) {
     console.error('=== FINAL ERROR ===');
