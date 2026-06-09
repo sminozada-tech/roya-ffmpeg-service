@@ -11,13 +11,36 @@ const OUTPUT_DIR = '/tmp/output';
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
+function createSRT(text, durationSeconds) {
+  const words = text.split(' ');
+  const wordsPerLine = 4;
+  const lines = [];
+  for (let i = 0; i < words.length; i += wordsPerLine) {
+    lines.push(words.slice(i, i + wordsPerLine).join(' '));
+  }
+  const timePerLine = durationSeconds / lines.length;
+  let srt = '';
+  lines.forEach((line, i) => {
+    const start = i * timePerLine;
+    const end = (i + 1) * timePerLine;
+    const fmt = (s) => {
+      const h = Math.floor(s / 3600).toString().padStart(2, '0');
+      const m = Math.floor((s % 3600) / 60).toString().padStart(2, '0');
+      const sec = Math.floor(s % 60).toString().padStart(2, '0');
+      const ms = Math.floor((s % 1) * 1000).toString().padStart(3, '0');
+      return `${h}:${m}:${sec},${ms}`;
+    };
+    srt += `${i + 1}\n${fmt(start)} --> ${fmt(end)}\n${line}\n\n`;
+  });
+  return srt;
+}
+
 app.post('/stitch', async (req, res) => {
   try {
-    const { videos, audios, output_name } = req.body;
+    const { videos, audios, captions, output_name } = req.body;
 
-    console.log(`Received ${videos.length} videos, ${audios ? audios.length : 0} audios`);
+    console.log(`Received ${videos.length} videos, ${audios ? audios.length : 0} audios, ${captions ? captions.length : 0} captions`);
 
-    // Clean up old files
     fs.readdirSync(UPLOAD_DIR).forEach(file => {
       try { fs.unlinkSync(path.join(UPLOAD_DIR, file)); } catch(e) {}
     });
@@ -34,57 +57,69 @@ app.post('/stitch', async (req, res) => {
       console.log(`Video ${i + 1} size: ${videoStats.size} bytes`);
       if (videoStats.size === 0) throw new Error(`Video ${i + 1} is empty!`);
 
-      // If audio provided, merge audio onto video
+      let currentPath = videoPath;
+
+      // Merge audio if provided
       if (audios && audios[i]) {
         const audioPath = path.join(UPLOAD_DIR, `scene${i + 1}_audio.mp3`);
         const cleanAudio = audios[i].replace(/^data:audio\/mp3;base64,/, '').replace(/^data:audio\/mpeg;base64,/, '');
         fs.writeFileSync(audioPath, Buffer.from(cleanAudio, 'base64'));
 
-        const audioStats = fs.statSync(audioPath);
-        console.log(`Audio ${i + 1} size: ${audioStats.size} bytes`);
-
         const mergedPath = path.join(UPLOAD_DIR, `scene${i + 1}_merged.mp4`);
-
-        // Merge video + audio, use video length as duration
         await new Promise((resolve, reject) => {
-          const cmd = `ffmpeg -y -i ${videoPath} -i ${audioPath} -map 0:v -map 1:a -c:v copy -c:a aac -shortest ${mergedPath}`;
-          console.log(`Merging scene ${i + 1}:`, cmd);
+          const cmd = `ffmpeg -y -i ${currentPath} -i ${audioPath} -map 0:v -map 1:a -c:v copy -c:a aac -shortest ${mergedPath}`;
+          console.log(`Merging audio scene ${i + 1}`);
           exec(cmd, (error, stdout, stderr) => {
-            if (error) {
-              console.error(`Merge error scene ${i + 1}:`, stderr);
-              reject(error);
-            } else {
-              resolve();
-            }
+            if (error) { console.error(stderr); reject(error); }
+            else resolve();
+          });
+        });
+        currentPath = mergedPath;
+      }
+
+      // Add captions if provided
+      if (captions && captions[i]) {
+        // Get video duration
+        const duration = await new Promise((resolve) => {
+          exec(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 ${currentPath}`, (err, stdout) => {
+            resolve(parseFloat(stdout) || 8);
           });
         });
 
-        finalScenePaths.push(mergedPath);
-      } else {
-        // No audio — use raw video
-        finalScenePaths.push(videoPath);
+        // Write SRT file
+        const srtPath = path.join(UPLOAD_DIR, `scene${i + 1}.srt`);
+        const srtContent = createSRT(captions[i], duration);
+        fs.writeFileSync(srtPath, srtContent);
+        console.log(`SRT for scene ${i + 1}:`, srtContent);
+
+        const captionedPath = path.join(UPLOAD_DIR, `scene${i + 1}_captioned.mp4`);
+        await new Promise((resolve, reject) => {
+          const cmd = `ffmpeg -y -i ${currentPath} -vf "subtitles=${srtPath}:force_style='FontName=Arial,FontSize=18,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Bold=1,Alignment=2,MarginV=50'" -c:a copy ${captionedPath}`;
+          console.log(`Adding captions scene ${i + 1}`);
+          exec(cmd, (error, stdout, stderr) => {
+            if (error) { console.error(stderr); reject(error); }
+            else resolve();
+          });
+        });
+        currentPath = captionedPath;
       }
+
+      finalScenePaths.push(currentPath);
     }
 
-    // Stitch all scenes together
+    // Stitch all scenes
     const concatFile = path.join(UPLOAD_DIR, 'concat.txt');
     fs.writeFileSync(concatFile, finalScenePaths.map(p => `file '${p}'`).join('\n'));
-
-    console.log('Concat file:', fs.readFileSync(concatFile, 'utf8'));
 
     const outputFileName = (output_name || 'stitched-video').replace(/[^a-zA-Z0-9_-]/g, '_');
     const outputPath = path.join(OUTPUT_DIR, `${outputFileName}.mp4`);
 
     await new Promise((resolve, reject) => {
       const cmd = `ffmpeg -y -f concat -safe 0 -i ${concatFile} -c copy ${outputPath}`;
-      console.log('Stitching:', cmd);
+      console.log('Stitching final video');
       exec(cmd, (error, stdout, stderr) => {
-        if (error) {
-          console.error('Stitch error:', stderr);
-          reject(error);
-        } else {
-          resolve();
-        }
+        if (error) { console.error(stderr); reject(error); }
+        else resolve();
       });
     });
 
@@ -92,8 +127,8 @@ app.post('/stitch', async (req, res) => {
     const base64Video = videoBuffer.toString('base64');
     console.log(`Final video size: ${videoBuffer.length} bytes`);
 
-    // Clean up
-    [...finalScenePaths].forEach(p => { try { fs.unlinkSync(p); } catch(e) {} });
+    // Cleanup
+    finalScenePaths.forEach(p => { try { fs.unlinkSync(p); } catch(e) {} });
     try { fs.unlinkSync(concatFile); } catch(e) {}
     try { fs.unlinkSync(outputPath); } catch(e) {}
 
