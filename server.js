@@ -12,7 +12,8 @@ if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
 function createSRT(text, durationSeconds) {
-  const words = text.split(' ');
+  if (!text || text.trim() === '') return null;
+  const words = text.trim().split(' ');
   const wordsPerLine = 4;
   const lines = [];
   for (let i = 0; i < words.length; i += wordsPerLine) {
@@ -38,8 +39,8 @@ function createSRT(text, durationSeconds) {
 app.post('/stitch', async (req, res) => {
   try {
     const { videos, audios, captions, output_name } = req.body;
-
-    console.log(`Received ${videos.length} videos, ${audios ? audios.length : 0} audios`);
+    console.log(`Videos: ${videos.length}, Audios: ${audios ? audios.length : 0}, Captions: ${captions ? captions.length : 0}`);
+    console.log('Captions received:', captions);
 
     fs.readdirSync(UPLOAD_DIR).forEach(file => {
       try { fs.unlinkSync(path.join(UPLOAD_DIR, file)); } catch(e) {}
@@ -48,66 +49,67 @@ app.post('/stitch', async (req, res) => {
     const finalScenePaths = [];
 
     for (let i = 0; i < videos.length; i++) {
-      // Write video
       const videoPath = path.join(UPLOAD_DIR, `scene${i + 1}_raw.mp4`);
       const cleanVideo = videos[i].replace(/^data:video\/mp4;base64,/, '');
       fs.writeFileSync(videoPath, Buffer.from(cleanVideo, 'base64'));
 
       const videoStats = fs.statSync(videoPath);
-      console.log(`Video ${i + 1} size: ${videoStats.size} bytes`);
       if (videoStats.size === 0) throw new Error(`Video ${i + 1} is empty!`);
 
-      // Get video duration
       const videoDuration = await new Promise((resolve) => {
         exec(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 ${videoPath}`, (err, stdout) => {
           resolve(parseFloat(stdout) || 8);
         });
       });
-      console.log(`Video ${i + 1} duration: ${videoDuration}s`);
+      console.log(`Scene ${i + 1} duration: ${videoDuration}s`);
 
       let currentPath = videoPath;
 
-      // Merge audio — pad audio to match video duration, never cut video
-      if (audios && audios[i]) {
+      // Merge audio
+      if (audios && audios[i] && audios[i].length > 0) {
         const audioPath = path.join(UPLOAD_DIR, `scene${i + 1}_audio.mp3`);
         const cleanAudio = audios[i].replace(/^data:audio\/mp3;base64,/, '').replace(/^data:audio\/mpeg;base64,/, '');
         fs.writeFileSync(audioPath, Buffer.from(cleanAudio, 'base64'));
 
         const mergedPath = path.join(UPLOAD_DIR, `scene${i + 1}_merged.mp4`);
         await new Promise((resolve, reject) => {
-          // Use video duration as master — audio gets padded with silence if shorter
           const cmd = `ffmpeg -y -i ${currentPath} -i ${audioPath} -map 0:v -map 1:a -c:v copy -c:a aac -t ${videoDuration} ${mergedPath}`;
-          console.log(`Merging audio scene ${i + 1}`);
           exec(cmd, (error, stdout, stderr) => {
-            if (error) { console.error(stderr); reject(error); }
-            else resolve();
+            if (error) { console.error(`Audio merge error:`, stderr); reject(error); }
+            else { console.log(`Audio merged for scene ${i + 1}`); resolve(); }
           });
         });
         currentPath = mergedPath;
+      } else {
+        console.log(`No audio for scene ${i + 1}`);
       }
 
-      // Add captions if provided
-      if (captions && captions[i]) {
-        const srtPath = path.join(UPLOAD_DIR, `scene${i + 1}.srt`);
+      // Add captions
+      if (captions && captions[i] && captions[i].trim().length > 0) {
+        console.log(`Adding caption for scene ${i + 1}: "${captions[i]}"`);
         const srtContent = createSRT(captions[i], videoDuration);
-        fs.writeFileSync(srtPath, srtContent);
+        if (srtContent) {
+          const srtPath = path.join(UPLOAD_DIR, `scene${i + 1}.srt`);
+          fs.writeFileSync(srtPath, srtContent);
 
-        const captionedPath = path.join(UPLOAD_DIR, `scene${i + 1}_captioned.mp4`);
-        await new Promise((resolve, reject) => {
-          const cmd = `ffmpeg -y -i ${currentPath} -vf "subtitles=${srtPath}:force_style='FontName=Arial,FontSize=18,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Bold=1,Alignment=2,MarginV=50'" -c:a copy ${captionedPath}`;
-          console.log(`Adding captions scene ${i + 1}`);
-          exec(cmd, (error, stdout, stderr) => {
-            if (error) { console.error(stderr); reject(error); }
-            else resolve();
+          const captionedPath = path.join(UPLOAD_DIR, `scene${i + 1}_captioned.mp4`);
+          await new Promise((resolve, reject) => {
+            const cmd = `ffmpeg -y -i ${currentPath} -vf "subtitles=${srtPath}:force_style='FontName=Arial,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=3,Bold=1,Alignment=2,MarginV=60'" -c:a copy ${captionedPath}`;
+            exec(cmd, (error, stdout, stderr) => {
+              if (error) { console.error(`Caption error:`, stderr); reject(error); }
+              else { console.log(`Captions added for scene ${i + 1}`); resolve(); }
+            });
           });
-        });
-        currentPath = captionedPath;
+          currentPath = captionedPath;
+        }
+      } else {
+        console.log(`No caption for scene ${i + 1}`);
       }
 
       finalScenePaths.push(currentPath);
     }
 
-    // Stitch all scenes
+    // Stitch
     const concatFile = path.join(UPLOAD_DIR, 'concat.txt');
     fs.writeFileSync(concatFile, finalScenePaths.map(p => `file '${p}'`).join('\n'));
 
@@ -116,16 +118,15 @@ app.post('/stitch', async (req, res) => {
 
     await new Promise((resolve, reject) => {
       const cmd = `ffmpeg -y -f concat -safe 0 -i ${concatFile} -c:a aac -c:v libx264 ${outputPath}`;
-      console.log('Stitching final video');
       exec(cmd, (error, stdout, stderr) => {
-        if (error) { console.error(stderr); reject(error); }
-        else resolve();
+        if (error) { console.error('Stitch error:', stderr); reject(error); }
+        else { console.log('Stitched successfully'); resolve(); }
       });
     });
 
     const videoBuffer = fs.readFileSync(outputPath);
     const base64Video = videoBuffer.toString('base64');
-    console.log(`Final video size: ${videoBuffer.length} bytes`);
+    console.log(`Final video: ${videoBuffer.length} bytes`);
 
     finalScenePaths.forEach(p => { try { fs.unlinkSync(p); } catch(e) {} });
     try { fs.unlinkSync(concatFile); } catch(e) {}
