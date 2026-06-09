@@ -39,7 +39,7 @@ app.post('/stitch', async (req, res) => {
   try {
     const { videos, audios, captions, output_name } = req.body;
 
-    console.log(`Received ${videos.length} videos, ${audios ? audios.length : 0} audios, ${captions ? captions.length : 0} captions`);
+    console.log(`Received ${videos.length} videos, ${audios ? audios.length : 0} audios`);
 
     fs.readdirSync(UPLOAD_DIR).forEach(file => {
       try { fs.unlinkSync(path.join(UPLOAD_DIR, file)); } catch(e) {}
@@ -57,9 +57,17 @@ app.post('/stitch', async (req, res) => {
       console.log(`Video ${i + 1} size: ${videoStats.size} bytes`);
       if (videoStats.size === 0) throw new Error(`Video ${i + 1} is empty!`);
 
+      // Get video duration
+      const videoDuration = await new Promise((resolve) => {
+        exec(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 ${videoPath}`, (err, stdout) => {
+          resolve(parseFloat(stdout) || 8);
+        });
+      });
+      console.log(`Video ${i + 1} duration: ${videoDuration}s`);
+
       let currentPath = videoPath;
 
-      // Merge audio if provided
+      // Merge audio — pad audio to match video duration, never cut video
       if (audios && audios[i]) {
         const audioPath = path.join(UPLOAD_DIR, `scene${i + 1}_audio.mp3`);
         const cleanAudio = audios[i].replace(/^data:audio\/mp3;base64,/, '').replace(/^data:audio\/mpeg;base64,/, '');
@@ -67,7 +75,8 @@ app.post('/stitch', async (req, res) => {
 
         const mergedPath = path.join(UPLOAD_DIR, `scene${i + 1}_merged.mp4`);
         await new Promise((resolve, reject) => {
-          const cmd = `ffmpeg -y -i ${currentPath} -i ${audioPath} -map 0:v -map 1:a -c:v copy -c:a aac -shortest ${mergedPath}`;
+          // Use video duration as master — audio gets padded with silence if shorter
+          const cmd = `ffmpeg -y -i ${currentPath} -i ${audioPath} -map 0:v -map 1:a -c:v copy -c:a aac -t ${videoDuration} ${mergedPath}`;
           console.log(`Merging audio scene ${i + 1}`);
           exec(cmd, (error, stdout, stderr) => {
             if (error) { console.error(stderr); reject(error); }
@@ -79,18 +88,9 @@ app.post('/stitch', async (req, res) => {
 
       // Add captions if provided
       if (captions && captions[i]) {
-        // Get video duration
-        const duration = await new Promise((resolve) => {
-          exec(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 ${currentPath}`, (err, stdout) => {
-            resolve(parseFloat(stdout) || 8);
-          });
-        });
-
-        // Write SRT file
         const srtPath = path.join(UPLOAD_DIR, `scene${i + 1}.srt`);
-        const srtContent = createSRT(captions[i], duration);
+        const srtContent = createSRT(captions[i], videoDuration);
         fs.writeFileSync(srtPath, srtContent);
-        console.log(`SRT for scene ${i + 1}:`, srtContent);
 
         const captionedPath = path.join(UPLOAD_DIR, `scene${i + 1}_captioned.mp4`);
         await new Promise((resolve, reject) => {
@@ -115,7 +115,7 @@ app.post('/stitch', async (req, res) => {
     const outputPath = path.join(OUTPUT_DIR, `${outputFileName}.mp4`);
 
     await new Promise((resolve, reject) => {
-      const cmd = `ffmpeg -y -f concat -safe 0 -i ${concatFile} -c copy ${outputPath}`;
+      const cmd = `ffmpeg -y -f concat -safe 0 -i ${concatFile} -c:a aac -c:v libx264 ${outputPath}`;
       console.log('Stitching final video');
       exec(cmd, (error, stdout, stderr) => {
         if (error) { console.error(stderr); reject(error); }
@@ -127,7 +127,6 @@ app.post('/stitch', async (req, res) => {
     const base64Video = videoBuffer.toString('base64');
     console.log(`Final video size: ${videoBuffer.length} bytes`);
 
-    // Cleanup
     finalScenePaths.forEach(p => { try { fs.unlinkSync(p); } catch(e) {} });
     try { fs.unlinkSync(concatFile); } catch(e) {}
     try { fs.unlinkSync(outputPath); } catch(e) {}
