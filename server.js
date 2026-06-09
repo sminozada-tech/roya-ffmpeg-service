@@ -46,7 +46,7 @@ app.post('/stitch', async (req, res) => {
         console.log(`Video: ${vSize} bytes`);
 
         if (vSize < 10000) {
-          console.log('️ Video too small, skipping');
+          console.log('⚠️ Video too small, skipping');
           continue;
         }
 
